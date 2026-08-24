@@ -1,5 +1,6 @@
 import { Api, fetchApi, WebRTCAnswer } from "../../api"
-import { ClientInputEvent, ControlPacket, ControlPacketConfig, controlPacketDeserialize, controlPacketSerialize, ControlStream, ControlStreamEvent, ControlStreamEvent_Tags, EstimatedRttInfo, InputBatcher, PacketDirection, UdpTransmit, VideoFormats, WebRtcSessionAnswer, webrtcSessionAnswerParse, WebRtcSessionOffer, webrtcSessionOfferApply } from "../../uniffi/moonlight_common_bindings"
+import { showNotification } from "../../component/notification"
+import { ClientInputEvent, ControlHost, ControlHostEvent, ControlHostEvent_Tags, ControlPacket, controlPacketChannel, ControlPacketConfig, controlPacketDeserialize, controlPacketKind, controlPacketSerialize, ControlPeerRole, EstimatedRttInfo, InputBatcher, PacketDirection, UdpTransmit, VideoFormats, WebRtcSessionAnswer, webrtcSessionAnswerParse, WebRtcSessionOffer, webrtcSessionOfferApply } from "../../uniffi/moonlight_common_bindings"
 import { globalObject, uniffiMillisUntil, uniffiNow, wait } from "../../util"
 import { AudioPlayer, TrackAudioPlayer } from "../audio/index"
 import { Logger } from "../log"
@@ -85,7 +86,7 @@ export class WebRTCTransport implements Transport {
         // Print ice candidates
         for (const line of response.answerSdp.split("\r\n")) {
             if (line.startsWith("a=candidate")) {
-                this.logger?.debug(`received remove ice candidate ${line.substring(2)}`)
+                this.logger?.debug(`received remote ice candidate ${line.substring(2)}`)
             }
         }
 
@@ -376,6 +377,8 @@ export class WebRTCTransport implements Transport {
 }
 
 const ENET_IP = "192.168.178.2:47999"
+// TODO: export this in the uniffi bindings
+const ENET_CHANNELS = 0x30
 
 class WebRtcControlStream implements IControlStream {
 
@@ -389,8 +392,9 @@ class WebRtcControlStream implements IControlStream {
     private batcher: InputBatcher = new InputBatcher()
 
     // Enet control stream
-    private controlStream: ControlStream | null = null
+    private controlHost: ControlHost | null = null
     private controlStreamPollTimeout: number | null = null
+    private enetPeer: number | null = null
     private enetConnected = false
 
     private packetBuffer: Array<ControlPacket> = []
@@ -405,13 +409,14 @@ class WebRtcControlStream implements IControlStream {
         this.channel = channel
 
         // Clean up old control stream if present
-        if (this.controlStream) {
-            this.controlStream.uniffiDestroy()
-            this.controlStream = null
+        if (this.controlHost) {
+            this.controlHost.uniffiDestroy()
+            this.controlHost = null
         }
         if (this.controlStreamPollTimeout != null) {
             globalObject().clearTimeout(this.controlStreamPollTimeout)
         }
+        this.enetPeer = null
         this.enetConnected = false
 
         if (this.channel && streamType && config) {
@@ -424,11 +429,13 @@ class WebRtcControlStream implements IControlStream {
             this.channel.addEventListener("message", this.boundMessage)
 
             if (this.streamType == "enet") {
-                this.controlStream = new ControlStream(uniffiNow(), {
-                    serverVersion: this.config.serverVersion,
-                    addr: ENET_IP,
+                this.controlHost = new ControlHost(uniffiNow(), {
+                    peerChannelCount: ENET_CHANNELS,
+                    peerCount: 1,
                 })
                 this.onDataChannelStateChange()
+
+                this.controlStreamCreatePeer()
             }
 
             this.trySendBufferedPackets()
@@ -454,11 +461,11 @@ class WebRtcControlStream implements IControlStream {
                 this.onreceive(packet)
             }
         } else if (this.streamType == "enet") {
-            if (!this.controlStream) {
+            if (!this.controlHost) {
                 throw "dropping packet because enet control stream is not initialized"
             }
 
-            this.controlStream.handleReceive(
+            this.controlHost.handleReceive(
                 uniffiNow(),
                 ENET_IP,
                 event.data
@@ -487,7 +494,7 @@ class WebRtcControlStream implements IControlStream {
             return
         }
 
-        if (this.streamType == "enet" && !this.enetConnected) {
+        if (this.streamType == "enet" && this.enetPeer == null) {
             return
         }
 
@@ -510,7 +517,7 @@ class WebRtcControlStream implements IControlStream {
 
         if (
             !this.channel || this.channel.readyState != "open" ||
-            (this.streamType == "enet" && (!this.controlStream || !this.enetConnected))
+            (this.streamType == "enet" && (!this.controlHost || !this.enetConnected))
         ) {
             this.packetBuffer.push(packet)
             return
@@ -518,6 +525,9 @@ class WebRtcControlStream implements IControlStream {
         if (!this.config) {
             throw "packet config not configured, but a packet was sent"
         }
+
+        const channel = controlPacketChannel(packet, this.config.serverVersion)
+        const kind = controlPacketKind(packet, this.config.serverVersion)
 
         this.trySendBufferedPackets()
 
@@ -528,7 +538,11 @@ class WebRtcControlStream implements IControlStream {
                 this.channel.send(data)
             }
         } else if (this.streamType == "enet") {
-            this.controlStream?.sendRaw(packet)
+            if (this.enetPeer == null) {
+                throw "enet peer doesn't exists, but should at this point"
+            }
+
+            this.controlHost?.send(this.enetPeer, channel, kind, packet)
             this.controlStreamPollOutput()
         } else {
             this.logger?.debug(`failed to send control packet ${JSON.stringify(packet)}`)
@@ -536,7 +550,10 @@ class WebRtcControlStream implements IControlStream {
     }
 
     estimatedRtt(): EstimatedRttInfo | null {
-        return this.controlStream?.estimatedRtt() ?? null
+        if (this.enetPeer == null) {
+            return null
+        }
+        return this.controlHost?.peerEstimatedRtt(this.enetPeer) ?? null
     }
 
     private sendBatchedInputs() {
@@ -552,7 +569,10 @@ class WebRtcControlStream implements IControlStream {
         }
         this.controlStreamPollTimeout = null
 
-        if (!this.controlStream) {
+        if (!this.controlHost) {
+            return
+        }
+        if (!this.config) {
             return
         }
         if (!this.channel) {
@@ -561,9 +581,10 @@ class WebRtcControlStream implements IControlStream {
 
         if (handleInput) {
             try {
-                this.controlStream.handleTimeout(uniffiNow())
+                this.controlHost.handleTimeout(uniffiNow())
             } catch (e) {
-                console.info("reconstructing enet control stream", e)
+                showNotification("control stream failed, reconnecting control stream")
+
                 if (this.config) {
                     this.setChannel(this.channel, "enet", this.config)
                 } else {
@@ -573,30 +594,58 @@ class WebRtcControlStream implements IControlStream {
         }
 
         let send: UdpTransmit | undefined
-        while (send = this.controlStream.pollPacket()) {
+        while (send = this.controlHost.pollPacket()) {
             console.debug(send.contents, "enet send")
             this.channel.send(send.contents)
         }
 
-        let event: ControlStreamEvent | undefined
-        while (event = this.controlStream.pollEvent()) {
-            if (event.tag === ControlStreamEvent_Tags.Connect) {
-                this.enetConnected = true
+        let event: ControlHostEvent | undefined
+        while (event = this.controlHost.pollEvent()) {
+            if (event.tag === ControlHostEvent_Tags.Connected) {
+                this.logger?.debug("control stream connected")
 
+                this.enetConnected = true
                 this.trySendBufferedPackets()
-            } else if (event.tag === ControlStreamEvent_Tags.Packet) {
+            } else if (event.tag === ControlHostEvent_Tags.Receive) {
                 if (this.onreceive) {
-                    this.onreceive(event.inner[0]);
+                    this.onreceive(event.inner.packet);
                 }
-            } else if (event.tag === ControlStreamEvent_Tags.Disconnect) {
+            } else if (event.tag === ControlHostEvent_Tags.Disconnected) {
                 this.logger?.debug("control stream got disconnected for an unknown reason, constructing with new client control stream")
-                this.enetConnected = false
+                this.enetPeer = null
+
+                this.controlStreamCreatePeer()
             }
         }
 
-        const timeout = this.controlStream.pollTimeout()
+        const timeout = this.controlHost.pollTimeout()
         if (timeout != undefined) {
             this.controlStreamPollTimeout = globalObject().setTimeout(this.boundPollOutput, uniffiMillisUntil(timeout))
         }
+    }
+    private controlStreamCreatePeer() {
+        if (!this.controlHost) {
+            throw "tried to create a new enet peer, but the protocol is not enet"
+        }
+        if (!this.config) {
+            return
+        }
+
+        if (this.enetPeer != null) {
+            this.controlHost?.disconnectNow(this.enetPeer, 0)
+            this.enetPeer = null
+            this.enetConnected = false
+        }
+
+        this.enetPeer = this.controlHost.connect(ENET_IP, {
+            channelCount: ENET_CHANNELS,
+            config: {
+                role: ControlPeerRole.Client,
+                packets: this.config,
+            },
+        })
+
+        const DAY = 1_000 * 60 * 60 * 24
+        this.controlHost.setPeerTimeout(this.enetPeer, DAY, DAY, DAY)
     }
 }

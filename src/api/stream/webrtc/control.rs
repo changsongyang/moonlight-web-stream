@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::net::Ipv4Addr;
+use std::time::Duration;
 use std::{net::SocketAddr, sync::Arc};
 
 use actix_web::web::Bytes;
@@ -246,6 +247,14 @@ impl ControlChannel {
                                 ) {
                                     warn!(error = %err, peer_id = ?id,"failed to configure remote control peer");
                                     continue;
+                                } else {
+                                    // Set peer timeout to infinity
+                                    assert!(host.set_peer_timeout(
+                                        id,
+                                        Duration::from_hours(24),
+                                        Duration::from_hours(24),
+                                        Duration::from_hours(24),
+                                    ));
                                 }
 
                                 if host.configured_peers().count() == 1 {
