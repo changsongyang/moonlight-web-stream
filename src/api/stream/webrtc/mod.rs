@@ -41,6 +41,7 @@ use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MIME_TYPE_OPUS, MediaEngine};
 use webrtc::api::setting_engine::SettingEngine;
+use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice::udp_network::{EphemeralUDP, UDPNetwork};
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
@@ -314,6 +315,15 @@ pub async fn webrtc_post(
         .await?;
     let peer = Arc::new(peer);
 
+    // Add data channel listener
+    let (on_data_channel_sender, on_data_channel) =
+        mpsc::unbounded_channel::<Arc<RTCDataChannel>>();
+    peer.on_data_channel(Box::new(move |channel| {
+        let _ = on_data_channel_sender.send(channel);
+
+        Box::pin(async move {})
+    }));
+
     info!("created server webrtc peer");
 
     info!("querying client for supported video and audio codecs");
@@ -445,11 +455,7 @@ pub async fn webrtc_post(
     info!("started moonlight stream");
 
     // -- Create control channel based on support
-    let result = if session.control_enet {
-        ControlChannel::new_enet(&peer).await
-    } else {
-        ControlChannel::new_simple(&peer).await
-    };
+    let result = ControlChannel::new(&peer).await;
     let control_channel = match result {
         Err(err) => {
             error!("failed to add control stream to webrtc peer");
@@ -519,6 +525,7 @@ pub async fn webrtc_post(
                 audio_channel,
                 video_channel,
                 control_channel,
+                on_data_channel,
             )
             .await
             {

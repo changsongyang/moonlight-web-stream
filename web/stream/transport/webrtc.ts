@@ -1,6 +1,6 @@
 import { Api, fetchApi, WebRTCAnswer } from "../../api"
 import { showNotification } from "../../component/notification"
-import { ClientInputEvent, ControlHost, ControlHostEvent, ControlHostEvent_Tags, ControlPacket, controlPacketChannel, ControlPacketConfig, controlPacketDeserialize, controlPacketKind, controlPacketSerialize, ControlPeerRole, EstimatedRttInfo, InputBatcher, PacketDirection, UdpTransmit, VideoFormats, WebRtcSessionAnswer, webrtcSessionAnswerParse, WebRtcSessionOffer, webrtcSessionOfferApply } from "../../uniffi/moonlight_common_bindings"
+import { ClientInputEvent, ControlHost, ControlPacket, ControlPacket_Tags, ControlPacketConfig, controlPacketDeserialize, controlPacketSerialize, InputBatcher, PacketDirection, VideoFormats, WebRtcSessionAnswer, webrtcSessionAnswerParse, WebRtcSessionOffer, webrtcSessionOfferApply } from "../../uniffi/moonlight_common_bindings"
 import { globalObject, uniffiMillisUntil, uniffiNow, wait } from "../../util"
 import { AudioPlayer, TrackAudioPlayer } from "../audio/index"
 import { Logger } from "../log"
@@ -13,7 +13,7 @@ export class WebRTCTransport implements Transport {
 
     readonly implementationName: string = "webrtc"
 
-    readonly controlStream = new WebRtcControlStream()
+    readonly controlStream
     onconnect: ((connectData: TransportConnectData) => void) | null = null
     onclose: ((shutdown: TransportShutdown) => void) | null = null
 
@@ -31,6 +31,7 @@ export class WebRTCTransport implements Transport {
 
         // Create peer
         this.peer = new RTCPeerConnection(configuration)
+        this.controlStream = new WebRtcControlStream(this.peer)
 
         this.logger?.debug(`Using ice servers ${JSON.stringify(configuration.iceServers?.flatMap(server => server.urls))}`)
 
@@ -66,7 +67,7 @@ export class WebRTCTransport implements Transport {
 
         // Insert custom options
         this.sdpOfferOptions = {
-            controlEnet: true,
+            controlEnet: false,
             ...options
         }
         const sdp = webrtcSessionOfferApply(offer.sdp ?? "", this.sdpOfferOptions)
@@ -208,17 +209,12 @@ export class WebRTCTransport implements Transport {
     private onDataChannel(event: RTCDataChannelEvent) {
         const channel = event.channel
 
-        this.logger?.debug(`received data channel with label: ${channel.label}, protocol: ${channel.protocol}`)
+        this.logger?.debug(`received data channel with label: ${channel.label}`)
 
         if (channel.label == "moonlight.control") {
             const config = generateControlPacketConfig()
 
-            let protocol: "simple" | "enet" = "simple"
-            if (channel.protocol == "enet") {
-                protocol = "enet"
-            }
-
-            this.controlStream.setChannel(channel, protocol, config)
+            this.controlStream.setChannel(channel, config)
         }
     }
 
@@ -329,11 +325,7 @@ export class WebRTCTransport implements Transport {
         const out: Record<string, StatValue> = {}
 
         // Control Stream
-        const estimatedRtt = this.controlStream.estimatedRtt()
-        if (estimatedRtt) {
-            out.estimatedClientToRelayRttMs = estimatedRtt.rtt
-            out.estimatedClientToRelayRttVarianceMs = estimatedRtt.rttVariance
-        }
+        // TODO
 
         const stats = await this.peer.getStats()
 
@@ -380,10 +372,6 @@ export class WebRTCTransport implements Transport {
     }
 }
 
-const ENET_IP = "192.168.178.2:47999"
-// TODO: export this in the uniffi bindings
-const ENET_CHANNELS = 0x30
-
 class WebRtcControlStream implements IControlStream {
 
     private logger?: Logger
@@ -391,62 +379,57 @@ class WebRtcControlStream implements IControlStream {
     private config: ControlPacketConfig | null = null
 
     private channel: RTCDataChannel | null = null
-    private streamType: "simple" | "enet" = "simple"
+
+    private keyLike: RTCDataChannel
+
+    private mouse: RTCDataChannel
+
+    private controller: RTCDataChannel
 
     private batcher: InputBatcher = new InputBatcher()
 
-    // Enet control stream
-    private controlHost: ControlHost | null = null
-    private controlStreamPollTimeout: number | null = null
-    private enetPeer: number | null = null
-    private enetConnected = false
-
     private packetBuffer: Array<ControlPacket> = []
 
-    constructor(logger?: Logger) {
+    constructor(peer: RTCPeerConnection, logger?: Logger) {
         this.logger = logger
+
+        this.keyLike = peer.createDataChannel("moonlight.control.key_like", {
+            ordered: false,
+            maxPacketLifeTime: 150,
+        })
+        this.mouse = peer.createDataChannel("moonlight.control.mouse", {
+            ordered: false,
+            maxRetransmits: 0,
+        })
+        this.controller = peer.createDataChannel("moonlight.control.controller", {
+            ordered: false,
+            maxRetransmits: 0,
+        })
+
+        for (const channel of [this.keyLike, this.mouse, this.controller]) {
+            channel.onbufferedamountlow = this.boundTrySendBufferedPackets
+        }
     }
 
-    setChannel(channel: null): void
-    setChannel(channel: RTCDataChannel, streamType: "simple" | "enet", config: ControlPacketConfig): void
-    setChannel(channel: RTCDataChannel | null, streamType?: "simple" | "enet", config?: ControlPacketConfig): void {
-        this.channel = channel
+    setChannel(channel: RTCDataChannel | null, config?: ControlPacketConfig): void {
+        if (channel && config) {
+            this.channel = channel
 
-        // Clean up old control stream if present
-        if (this.controlHost) {
-            this.controlHost.uniffiDestroy()
-            this.controlHost = null
-        }
-        if (this.controlStreamPollTimeout != null) {
-            globalObject().clearTimeout(this.controlStreamPollTimeout)
-        }
-        this.enetPeer = null
-        this.enetConnected = false
-
-        if (this.channel && streamType && config) {
             this.config = config
-            this.streamType = streamType
 
             this.channel.binaryType = "arraybuffer"
 
-            this.channel.addEventListener("open", this.boundChannelStateChange)
+            this.channel.addEventListener("open", this.boundTrySendBufferedPackets)
+            this.channel.addEventListener("bufferedamountlow", this.boundTrySendBufferedPackets)
             this.channel.addEventListener("message", this.boundMessage)
-
-            if (this.streamType == "enet") {
-                this.controlHost = new ControlHost(uniffiNow(), {
-                    peerChannelCount: ENET_CHANNELS,
-                    peerCount: 1,
-                })
-                this.onDataChannelStateChange()
-
-                this.controlStreamCreatePeer()
-            }
 
             this.trySendBufferedPackets()
         } else {
-            this.streamType = "simple"
-            this.channel?.removeEventListener("open", this.boundChannelStateChange)
+            this.channel?.removeEventListener("open", this.boundTrySendBufferedPackets)
+            this.channel?.removeEventListener("bufferedamountlow", this.boundTrySendBufferedPackets)
             this.channel?.removeEventListener("message", this.boundMessage)
+
+            this.channel = null
         }
     }
 
@@ -458,53 +441,10 @@ class WebRtcControlStream implements IControlStream {
             throw "packet config not configured, but a packet was received"
         }
 
-        if (this.streamType == "simple") {
-            const packet = controlPacketDeserialize(this.config, PacketDirection.ClientBound, event.data)
+        const packet = controlPacketDeserialize(this.config, PacketDirection.ClientBound, event.data)
 
-            if (packet && this.onreceive) {
-                this.onreceive(packet)
-            }
-        } else if (this.streamType == "enet") {
-            if (!this.controlHost) {
-                throw "dropping packet because enet control stream is not initialized"
-            }
-
-            this.controlHost.handleReceive(
-                uniffiNow(),
-                ENET_IP,
-                event.data
-            )
-
-            this.controlStreamPollOutput(false)
-        } else {
-            this.logger?.debug("failed to deserialize packet")
-            console.debug("failed to deserialize packet", event.data)
-        }
-    }
-
-    private boundChannelStateChange = this.onDataChannelStateChange.bind(this)
-    private onDataChannelStateChange() {
-        if (this.channel?.readyState == "open") {
-            this.trySendBufferedPackets()
-
-            if (this.streamType == "enet" && this.controlStreamPollTimeout == null) {
-                // Start loop
-                this.controlStreamPollOutput()
-            }
-        }
-    }
-    private trySendBufferedPackets() {
-        if (!this.channel || this.channel.readyState != "open") {
-            return
-        }
-
-        if (this.streamType == "enet" && this.enetPeer == null) {
-            return
-        }
-
-        // Send buffered packets
-        for (const packet of this.packetBuffer.splice(0)) {
-            this.sendRaw(packet)
+        if (packet && this.onreceive) {
+            this.onreceive(packet)
         }
     }
 
@@ -517,139 +457,73 @@ class WebRtcControlStream implements IControlStream {
     }
 
     sendRaw(packet: ControlPacket): void {
-        console.debug(packet, "sending control packet")
-
-        if (
-            !this.channel || this.channel.readyState != "open" ||
-            (this.streamType == "enet" && (!this.controlHost || !this.enetConnected))
-        ) {
-            this.packetBuffer.push(packet)
-            return
-        }
-        if (!this.config) {
-            throw "packet config not configured, but a packet was sent"
-        }
-
-        const channel = controlPacketChannel(packet, this.config.serverVersion)
-        const kind = controlPacketKind(packet, this.config.serverVersion)
-
         this.trySendBufferedPackets()
 
-        if (this.streamType == "simple") {
-            const data = controlPacketSerialize(this.config, packet)
-            console.debug(data, "sending control data")
-            if (data) {
-                this.channel.send(data)
-            }
-        } else if (this.streamType == "enet") {
-            if (this.enetPeer == null) {
-                throw "enet peer doesn't exists, but should at this point"
-            }
-
-            this.controlHost?.send(this.enetPeer, channel, kind, packet)
-            this.controlStreamPollOutput()
-        } else {
-            this.logger?.debug(`failed to send control packet ${JSON.stringify(packet)}`)
+        if (!this.trySendRaw(packet)) {
+            this.packetBuffer.push(packet)
         }
     }
-
-    estimatedRtt(): EstimatedRttInfo | null {
-        if (this.enetPeer == null) {
-            return null
+    private trySendRaw(packet: ControlPacket): boolean {
+        if (!this.channel || !this.config) {
+            return false
         }
-        return this.controlHost?.peerEstimatedRtt(this.enetPeer) ?? null
+
+        let channel = this.channel
+        let maxBufferedAmount = 16 * 1024
+        let canDrop = false
+        switch (packet.tag) {
+            case ControlPacket_Tags.MouseMoveRelative:
+            case ControlPacket_Tags.MouseMoveAbsolute:
+                channel = this.mouse
+                maxBufferedAmount = 1024
+                canDrop = true
+                break
+            case ControlPacket_Tags.MouseButton:
+            case ControlPacket_Tags.Keyboard:
+                channel = this.keyLike
+                maxBufferedAmount = 1024
+                canDrop = true
+                break
+            case ControlPacket_Tags.ControllerState:
+                channel = this.controller
+                maxBufferedAmount = 4096
+                canDrop = true
+                break
+        }
+
+        if (
+            channel.readyState != "open" ||
+            channel.bufferedAmount > maxBufferedAmount
+        ) {
+            if (canDrop) {
+                console.info(packet, "dropping packet because of exceeded buffered amount")
+                return true
+            }
+            return false
+        }
+
+        console.debug(packet, `sending packet over ${channel.label}`)
+        const data = controlPacketSerialize(this.config, packet)
+        if (data) {
+            channel.send(data)
+        }
+
+        return true
+    }
+
+    private boundTrySendBufferedPackets = this.trySendBufferedPackets.bind(this)
+    private trySendBufferedPackets() {
+        // Try to send packets
+        for (const packet of this.packetBuffer.splice(0)) {
+            if (!this.trySendRaw(packet)) {
+                this.packetBuffer.push(packet)
+            }
+        }
     }
 
     private sendBatchedInputs() {
         for (const packet of this.batcher.removeBatchedInputs()) {
             this.sendRaw(packet)
         }
-    }
-
-    private boundPollOutput = this.controlStreamPollOutput.bind(this)
-    private controlStreamPollOutput(handleInput = true) {
-        if (this.controlStreamPollTimeout != null) {
-            globalObject().clearTimeout(this.controlStreamPollTimeout)
-        }
-        this.controlStreamPollTimeout = null
-
-        if (!this.controlHost) {
-            return
-        }
-        if (!this.config) {
-            return
-        }
-        if (!this.channel) {
-            return
-        }
-
-        if (handleInput) {
-            try {
-                this.controlHost.handleTimeout(uniffiNow())
-            } catch (e) {
-                showNotification("control stream failed, reconnecting control stream")
-
-                if (this.config) {
-                    this.setChannel(this.channel, "enet", this.config)
-                } else {
-                    this.logger?.debug("failed to reconstruct new client control stream because of missing packet config")
-                }
-            }
-        }
-
-        let send: UdpTransmit | undefined
-        while (send = this.controlHost.pollPacket()) {
-            console.debug(send.contents, "enet send")
-            this.channel.send(send.contents)
-        }
-
-        let event: ControlHostEvent | undefined
-        while (event = this.controlHost.pollEvent()) {
-            if (event.tag === ControlHostEvent_Tags.Connected) {
-                this.logger?.debug("control stream connected")
-
-                this.enetConnected = true
-                this.trySendBufferedPackets()
-            } else if (event.tag === ControlHostEvent_Tags.Receive) {
-                if (this.onreceive) {
-                    this.onreceive(event.inner.packet);
-                }
-            } else if (event.tag === ControlHostEvent_Tags.Disconnected) {
-                this.logger?.debug("control stream got disconnected for an unknown reason, constructing with new client control stream")
-                this.enetPeer = null
-
-                this.controlStreamCreatePeer()
-            }
-        }
-
-        const timeout = this.controlHost.pollTimeout()
-        if (timeout != undefined) {
-            this.controlStreamPollTimeout = globalObject().setTimeout(this.boundPollOutput, uniffiMillisUntil(timeout))
-        }
-    }
-    private controlStreamCreatePeer() {
-        if (!this.controlHost) {
-            throw "tried to create a new enet peer, but the protocol is not enet"
-        }
-        if (!this.config) {
-            return
-        }
-
-        if (this.enetPeer != null) {
-            this.controlHost?.disconnectNow(this.enetPeer, 0)
-            this.enetPeer = null
-            this.enetConnected = false
-        }
-
-        this.enetPeer = this.controlHost.connect(ENET_IP, {
-            channelCount: ENET_CHANNELS,
-            config: {
-                role: ControlPeerRole.Client,
-                packets: this.config,
-            },
-        })
-
-        const DAY = 1_000 * 60 * 60 * 24
-        this.controlHost.setPeerTimeout(this.enetPeer, DAY, DAY, DAY)
     }
 }

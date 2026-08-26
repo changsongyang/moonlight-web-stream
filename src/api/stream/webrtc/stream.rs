@@ -1,3 +1,5 @@
+use std::{future::pending, sync::Arc};
+
 use moonlight_common::stream::{
     proto::{
         audio::AudioStreamEvent,
@@ -6,9 +8,12 @@ use moonlight_common::stream::{
     },
     tokio::{MoonlightStream, MoonlightStreamEvent},
 };
-use tokio::select;
+use tokio::{select, sync::mpsc};
 use tracing::{debug, info, warn};
-use webrtc::peer_connection::{RTCPeerConnection, peer_connection_state::RTCPeerConnectionState};
+use webrtc::{
+    data_channel::RTCDataChannel,
+    peer_connection::{RTCPeerConnection, peer_connection_state::RTCPeerConnectionState},
+};
 
 use crate::{
     api::stream::webrtc::{
@@ -25,11 +30,11 @@ pub async fn webrtc_loop(
     mut audio_channel: AudioChannel,
     mut video_channel: VideoChannel,
     mut control_channel: ControlChannel,
+    mut on_data_channel: mpsc::UnboundedReceiver<Arc<RTCDataChannel>>,
 ) -> Result<(), AppError> {
     info!("started main webrtc loop");
 
     let mut moonlight_disconnected = false;
-    let mut control_channel_active = false;
     loop {
         if !stream.is_alive() {
             info!("stopping stream because the moonlight stream is dead");
@@ -46,6 +51,13 @@ pub async fn webrtc_loop(
         }
 
         select! {
+            Some(data_channel) = async { if on_data_channel.is_closed() { pending().await } else { on_data_channel.recv().await } } => {
+                debug!(data_channel = ?data_channel.label(), "got data channel");
+
+                if control_channel.try_add_channel(&data_channel) {
+                    continue;
+                }
+            }
             result = stream.drive() => {
                 if moonlight_disconnected {
                     continue;
@@ -55,10 +67,6 @@ pub async fn webrtc_loop(
 
                 match event {
                     MoonlightStreamEvent::Audio(AudioStreamEvent::OnFrame(frame)) => {
-                        if !control_channel_active {
-                            continue;
-                        }
-
                         audio_channel.on_frame(frame);
                     }
                     MoonlightStreamEvent::Video(VideoStreamEvent::SignalIdr) => {
@@ -67,10 +75,6 @@ pub async fn webrtc_loop(
                         }
                     }
                     MoonlightStreamEvent::Video(VideoStreamEvent::OnFrame(frame)) => {
-                        if !control_channel_active {
-                            continue;
-                        }
-
                         video_channel.on_frame(frame);
                     }
                     MoonlightStreamEvent::Control(ControlStreamEvent::Packet(packet)) => {
@@ -98,18 +102,13 @@ pub async fn webrtc_loop(
                 let event = result?;
 
                 match event {
-                    ControlChannelEvent::Active => {
-                        control_channel_active = true;
-                        debug!("control channel active");
-                    },
-                    ControlChannelEvent::Inactive => {
-                        control_channel_active = false;
-                        debug!("control channel inactive");
-                    },
                     ControlChannelEvent::Packet(packet) => {
                         if let Err(err) = stream.send_raw(packet) {
                             warn!(error = %err, "failed to relay webrtc client packet to server");
                         }
+                    },
+                    ControlChannelEvent::Closed => {
+                        info!("control channel closed");
                     },
                 }
             }
