@@ -380,8 +380,9 @@ class WebRtcControlStream implements IControlStream {
 
     private channel: RTCDataChannel | null = null
 
-    private keyLike: RTCDataChannel
+    private keyboard: RTCDataChannel
 
+    private mouseButton: RTCDataChannel
     private mouse: RTCDataChannel
 
     private controller: RTCDataChannel
@@ -393,8 +394,8 @@ class WebRtcControlStream implements IControlStream {
     constructor(peer: RTCPeerConnection, logger?: Logger) {
         this.logger = logger
 
-        this.keyLike = peer.createDataChannel("moonlight.control.key_like")
-        this.keyLike.bufferedAmountLowThreshold = this.maxBufferedAmount(this.keyLike)
+        this.mouseButton = peer.createDataChannel("moonlight.control.mouse_button")
+        this.mouseButton.bufferedAmountLowThreshold = this.maxBufferedAmount(this.mouseButton)
 
         // TODO: batch better
         this.mouse = peer.createDataChannel("moonlight.control.mouse", {
@@ -403,6 +404,9 @@ class WebRtcControlStream implements IControlStream {
         })
         this.mouse.bufferedAmountLowThreshold = this.maxBufferedAmount(this.mouse)
 
+        this.keyboard = peer.createDataChannel("moonlight.control.keyboard")
+        this.keyboard.bufferedAmountLowThreshold = this.maxBufferedAmount(this.keyboard)
+
         // TODO: only send latest state (e.g. controllerstate array)
         this.controller = peer.createDataChannel("moonlight.control.controller", {
             ordered: false,
@@ -410,16 +414,18 @@ class WebRtcControlStream implements IControlStream {
         })
         this.controller.bufferedAmountLowThreshold = this.maxBufferedAmount(this.controller)
 
-        for (const channel of [this.keyLike, this.mouse, this.controller]) {
+        for (const channel of [this.mouseButton, this.mouse, this.keyboard, this.controller]) {
             channel.onbufferedamountlow = this.boundTrySendBufferedPackets
         }
     }
 
     private maxBufferedAmount(channel: RTCDataChannel): number {
         switch (channel) {
-            case this.keyLike:
+            case this.keyboard:
                 return 1024
             case this.mouse:
+                return 1024
+            case this.mouseButton:
                 return 1024
             case this.controller:
                 return 4 * 1024
@@ -492,14 +498,19 @@ class WebRtcControlStream implements IControlStream {
         let channel = this.channel
         let canDrop = false
         switch (packet.tag) {
+            case ControlPacket_Tags.MouseButton:
+                channel = this.mouseButton
+                // TODO: only drop based on currently pressed keys
+                canDrop = true
+                break
             case ControlPacket_Tags.MouseMoveRelative:
             case ControlPacket_Tags.MouseMoveAbsolute:
                 channel = this.mouse
                 canDrop = true
                 break
-            case ControlPacket_Tags.MouseButton:
             case ControlPacket_Tags.Keyboard:
-                channel = this.keyLike
+                channel = this.keyboard
+                // TODO: only drop based on currently pressed keys
                 canDrop = true
                 break
             case ControlPacket_Tags.ControllerState:

@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use actix_web::web::Bytes;
 use futures::future::{Either, pending};
-use log::info;
 use moonlight_common::stream::proto::control::packet::{
     ControlPacket, ControlPacketConfig, PacketDirection,
 };
@@ -11,7 +10,7 @@ use tokio::select;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::oneshot;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::{
     data_channel::data_channel_state::RTCDataChannelState, peer_connection::RTCPeerConnection,
@@ -63,7 +62,7 @@ impl ControlChannel {
         if !channel.label().starts_with("moonlight.control.") {
             return false;
         }
-        info!("adding control channel");
+        info!(label = %channel.label(), "adding control channel");
 
         let on_receive_sender = self.on_receive_sender.clone();
         channel.on_message(Box::new(move |message| {
