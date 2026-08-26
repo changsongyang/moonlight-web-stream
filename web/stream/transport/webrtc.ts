@@ -393,21 +393,40 @@ class WebRtcControlStream implements IControlStream {
     constructor(peer: RTCPeerConnection, logger?: Logger) {
         this.logger = logger
 
-        this.keyLike = peer.createDataChannel("moonlight.control.key_like", {
-            ordered: false,
-            maxPacketLifeTime: 150,
-        })
+        this.keyLike = peer.createDataChannel("moonlight.control.key_like")
+        this.keyLike.bufferedAmountLowThreshold = this.maxBufferedAmount(this.keyLike)
+
+        // TODO: batch better
         this.mouse = peer.createDataChannel("moonlight.control.mouse", {
             ordered: false,
             maxRetransmits: 0,
         })
+        this.mouse.bufferedAmountLowThreshold = this.maxBufferedAmount(this.mouse)
+
+        // TODO: only send latest state (e.g. controllerstate array)
         this.controller = peer.createDataChannel("moonlight.control.controller", {
             ordered: false,
             maxRetransmits: 0,
         })
+        this.controller.bufferedAmountLowThreshold = this.maxBufferedAmount(this.controller)
 
         for (const channel of [this.keyLike, this.mouse, this.controller]) {
             channel.onbufferedamountlow = this.boundTrySendBufferedPackets
+        }
+    }
+
+    private maxBufferedAmount(channel: RTCDataChannel): number {
+        switch (channel) {
+            case this.keyLike:
+                return 1024
+            case this.mouse:
+                return 1024
+            case this.controller:
+                return 4 * 1024
+            case this.channel:
+                return 16 * 1024
+            default:
+                return 1024
         }
     }
 
@@ -422,6 +441,8 @@ class WebRtcControlStream implements IControlStream {
             this.channel.addEventListener("open", this.boundTrySendBufferedPackets)
             this.channel.addEventListener("bufferedamountlow", this.boundTrySendBufferedPackets)
             this.channel.addEventListener("message", this.boundMessage)
+
+            this.channel.bufferedAmountLowThreshold = this.maxBufferedAmount(this.channel)
 
             this.trySendBufferedPackets()
         } else {
@@ -469,27 +490,24 @@ class WebRtcControlStream implements IControlStream {
         }
 
         let channel = this.channel
-        let maxBufferedAmount = 16 * 1024
         let canDrop = false
         switch (packet.tag) {
             case ControlPacket_Tags.MouseMoveRelative:
             case ControlPacket_Tags.MouseMoveAbsolute:
                 channel = this.mouse
-                maxBufferedAmount = 1024
                 canDrop = true
                 break
             case ControlPacket_Tags.MouseButton:
             case ControlPacket_Tags.Keyboard:
                 channel = this.keyLike
-                maxBufferedAmount = 1024
                 canDrop = true
                 break
             case ControlPacket_Tags.ControllerState:
                 channel = this.controller
-                maxBufferedAmount = 4096
                 canDrop = true
                 break
         }
+        const maxBufferedAmount = this.maxBufferedAmount(channel)
 
         if (
             channel.readyState != "open" ||
